@@ -24,18 +24,40 @@ class MagiskModuleInstaller @Inject constructor(
         private const val MODULE_ID = "olinky-selinux"
         private const val MODULE_ASSET_NAME = "olinky-selinux-helper.zip"
         private const val CANARY_DIR = "/config/usb_gadget/olinky_canary"
+        private val MODULE_ARTIFACT_PATHS = listOf(
+            "/data/adb/modules/$MODULE_ID",
+            "/data/adb/modules_update/$MODULE_ID",
+            "/data/adb/modules_update/${MODULE_ID}.zip"
+        )
         private val MAGISK_BINARIES = listOf(
             "magisk",
             "/sbin/magisk",
             "/system/bin/magisk",
             "/system/xbin/magisk",
-            "/data/adb/magisk/magisk"
+            "/system_ext/bin/magisk",
+            "/vendor/bin/magisk",
+            "/data/adb/magisk/magisk",
+            "/data/adb/magisk/magisk32",
+            "/data/adb/magisk/magisk64"
         )
     }
 
     private suspend fun findMagiskBinary(): String? {
         MAGISK_BINARIES.forEach { candidate ->
-            val result = rootShell.runScript("if command -v $candidate >/dev/null 2>&1; then echo $candidate; fi")
+            val escaped = candidate.replace("\"", "\\\"")
+            val script = """
+                if [ -x "$escaped" ]; then
+                    echo "$escaped"
+                    exit 0
+                fi
+                resolved=`command -v "$escaped" 2>/dev/null`
+                if [ -n "${'$'}resolved" ]; then
+                    echo "${'$'}resolved"
+                    exit 0
+                fi
+                exit 1
+            """.trimIndent()
+            val result = rootShell.runScript(script)
             if (result.exitCode == 0) {
                 val path = result.stdout.firstOrNull()?.trim()
                 if (!path.isNullOrEmpty()) {
@@ -63,9 +85,21 @@ class MagiskModuleInstaller @Inject constructor(
      * Checks if the oLinky helper module is already installed and enabled in Magisk.
      */
     private suspend fun isModuleInstalled(): Boolean {
+        if (moduleArtifactsPresent()) {
+            return true
+        }
         val magiskBinary = findMagiskBinary() ?: return false
         val result = rootShell.runScript("$magiskBinary --list-modules")
         return result.stdout.any { it.contains(MODULE_ID) }
+    }
+
+    private suspend fun moduleArtifactsPresent(): Boolean {
+        MODULE_ARTIFACT_PATHS.forEach { path ->
+            if (rootShell.fileExists(path)) {
+                return true
+            }
+        }
+        return false
     }
 
     /**
@@ -117,17 +151,24 @@ class MagiskModuleInstaller @Inject constructor(
         } ?: return false
 
         val magiskBinary = findMagiskBinary()
+        val escapedModulePath = moduleFile.absolutePath.replace("'", "'\\''")
         val result = if (magiskBinary != null) {
-            rootShell.runScript("$magiskBinary --install-module ${moduleFile.absolutePath}")
+            rootShell.runCommand(magiskBinary, "--install-module", moduleFile.absolutePath)
         } else {
-            rootShell.runScript(
-                "mkdir -p /data/adb/modules_update && cp ${moduleFile.absolutePath} /data/adb/modules_update/${MODULE_ID}.zip && chmod 644 /data/adb/modules_update/${MODULE_ID}.zip"
-            )
+            val fallbackScript = """
+                set -e
+                MODULE_PATH='${escapedModulePath}'
+                mkdir -p /data/adb/modules_update
+                rm -rf /data/adb/modules_update/$MODULE_ID /data/adb/modules_update/${MODULE_ID}.zip
+                cp "${'$'}MODULE_PATH" /data/adb/modules_update/${MODULE_ID}.zip
+                chmod 0644 /data/adb/modules_update/${MODULE_ID}.zip
+            """.trimIndent()
+            rootShell.runScript(fallbackScript)
         }
         withContext(Dispatchers.IO) {
             moduleFile.delete()
         }
-        return result.exitCode == 0
+        return result.exitCode == 0 || moduleArtifactsPresent()
     }
 }
 
