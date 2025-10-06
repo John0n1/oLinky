@@ -20,6 +20,26 @@ object RootShell {
         return result.exitCode == 0 && result.stdout.firstOrNull()?.trim() == "0"
     }
 
+    /**
+     * Detect SELinux status. Returns "enforcing", "permissive", "disabled", or "unknown".
+     */
+    suspend fun getSELinuxStatus(timeoutMillis: Long = DEFAULT_TIMEOUT): String {
+        val result = runScript("getenforce", timeoutMillis)
+        return if (result.exitCode == 0) {
+            result.stdout.firstOrNull()?.trim()?.lowercase() ?: "unknown"
+        } else {
+            "unknown"
+        }
+    }
+
+    /**
+     * Check if a file or directory exists.
+     */
+    suspend fun fileExists(path: String, timeoutMillis: Long = DEFAULT_TIMEOUT): Boolean {
+        val result = runScript("[ -e \"$path\" ] && echo 1 || echo 0", timeoutMillis)
+        return result.exitCode == 0 && result.stdout.firstOrNull()?.trim() == "1"
+    }
+
     suspend fun runCommand(vararg command: String, timeoutMillis: Long = DEFAULT_TIMEOUT): ShellResult {
         require(command.isNotEmpty()) { "Command must not be empty" }
         val commandString = command.joinToString(" ") { it.escapeForShell() }

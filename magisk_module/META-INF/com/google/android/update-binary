@@ -1,0 +1,6 @@
+ui_print "*******************************"
+ui_print "    oLinky SELinux Helper        "
+ui_print "*******************************"
+ui_print " "
+ui_print "- Granting ConfigFS permissions to apps"
+ui_print " "

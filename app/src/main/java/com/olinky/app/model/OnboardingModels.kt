@@ -74,7 +74,9 @@ data class OnboardingUiState(
     val errorMessage: String? = null,
     val completed: Boolean = false,
     val enabledProfileIds: Set<String> = availableProfiles.map { it.id }.toSet(),
-    val recommendedProfileId: String? = null
+    val recommendedProfileId: String? = null,
+    val autoMountEnabled: Boolean = false,
+    val darkModeEnabled: Boolean = false
 ) {
     val activeProfile: UsbProfile?
         get() = availableProfiles.firstOrNull { it.id == usbProfileId }

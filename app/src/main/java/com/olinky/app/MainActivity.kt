@@ -8,13 +8,19 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import com.olinky.app.model.UsbProfiles
 import com.olinky.app.ui.OLinkyAppTheme
 import com.olinky.app.ui.screens.OnboardingScreen
 import com.olinky.app.ui.screens.OverviewScreen
+import com.olinky.app.ui.screens.SettingsScreen
 import com.olinky.app.viewmodel.OnboardingViewModel
-import com.olinky.app.viewmodel.OverviewViewModel
+import dagger.hilt.android.AndroidEntryPoint
+import androidx.hilt.navigation.compose.hiltViewModel
 
+@AndroidEntryPoint
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -22,34 +28,45 @@ class MainActivity : ComponentActivity() {
         setContent {
             OLinkyAppTheme {
                 Surface(color = MaterialTheme.colorScheme.background) {
-                    val onboardingViewModel: OnboardingViewModel = viewModel()
+                    val onboardingViewModel: OnboardingViewModel = hiltViewModel()
                     val onboardingState by onboardingViewModel.state.collectAsState()
+                    var showSettings by remember { mutableStateOf(false) }
 
-                    if (!onboardingState.completed) {
-                        OnboardingScreen(
-                            state = onboardingState,
-                            onRequestRoot = onboardingViewModel::requestRootAccess,
-                            onCreateDirectory = onboardingViewModel::createDefaultDirectory,
-                            onSelectUsbProfile = onboardingViewModel::selectUsbProfile,
-                            onDismissError = onboardingViewModel::clearError,
-                            onRequestStoragePermission = onboardingViewModel::requestStoragePermission,
-                            onRefreshStoragePermission = onboardingViewModel::refreshStoragePermissionState
-                        )
-                    } else {
-                        val overviewViewModel: OverviewViewModel = viewModel()
-                        val overviewState by overviewViewModel.state.collectAsState()
-
-                        OverviewScreen(
-                            state = overviewState,
-                            onMountImage = { id, writable -> overviewViewModel.mountImage(id, writable) },
-                            onUnmountImage = overviewViewModel::unmountImage,
-                            onToggleWritable = overviewViewModel::toggleWritable,
-                            onStartPxe = overviewViewModel::startPxe,
-                            onStopPxe = overviewViewModel::stopPxe,
-                            onAddSampleImage = overviewViewModel::addSampleImage,
-                            onRefreshStatus = overviewViewModel::refresh,
-                            onClearErrors = overviewViewModel::clearErrors
-                        )
+                    when {
+                        !onboardingState.completed -> {
+                            OnboardingScreen(
+                                state = onboardingState,
+                                onRequestRoot = onboardingViewModel::requestRootAccess,
+                                onCreateDirectory = onboardingViewModel::createDefaultDirectory,
+                                onSelectUsbProfile = onboardingViewModel::selectUsbProfile,
+                                onDismissError = onboardingViewModel::clearError,
+                                onRequestStoragePermission = onboardingViewModel::requestStoragePermission,
+                                onRefreshStoragePermission = onboardingViewModel::refreshStoragePermissionState
+                            )
+                        }
+                        showSettings -> {
+                            SettingsScreen(
+                                libraryPath = onboardingState.imageDirectory,
+                                usbProfile = onboardingState.usbProfileId,
+                                rootGranted = onboardingState.rootGranted,
+                                autoMountEnabled = onboardingState.autoMountEnabled,
+                                darkModeEnabled = onboardingState.darkModeEnabled,
+                                availableProfiles = UsbProfiles.defaults,
+                                onNavigateBack = { showSettings = false },
+                                onRetestRoot = onboardingViewModel::requestRootAccess,
+                                onChangeDirectory = onboardingViewModel::setCustomDirectory,
+                                onSelectUsbProfile = onboardingViewModel::selectUsbProfile,
+                                onRerunOnboarding = {
+                                    onboardingViewModel.resetOnboarding()
+                                    showSettings = false
+                                },
+                                onAutoMountChanged = onboardingViewModel::setAutoMountEnabled,
+                                onDarkModeChanged = onboardingViewModel::setDarkModeEnabled
+                            )
+                        }
+                        else -> {
+                            OverviewScreen(onNavigateToSettings = { showSettings = true })
+                        }
                     }
                 }
             }

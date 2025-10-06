@@ -16,6 +16,7 @@ import com.olinky.app.model.UsbProfiles
 import com.olinky.core.root.RootShell
 import com.olinky.data.OnboardingPreferences
 import com.olinky.data.OnboardingRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,13 +25,16 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import javax.inject.Inject
 
-class OnboardingViewModel(application: Application) : AndroidViewModel(application) {
-
-    private val repository = OnboardingRepository(application.applicationContext)
+@HiltViewModel
+class OnboardingViewModel @Inject constructor(
+    application: Application,
+    private val repository: OnboardingRepository
+) : AndroidViewModel(application) {
     private val defaultDirectory = File(Environment.getExternalStorageDirectory(), "oLinky/images")
     private val usbProfiles = UsbProfiles.defaults
-    private val detectionResult = detectUsbProfiles(usbProfiles)
+    private var cachedDetectionResult: UsbProfileDetection? = null
     private var autoProfileApplied = false
 
     private val _state = MutableStateFlow(
@@ -38,9 +42,9 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
             availableProfiles = usbProfiles,
             defaultDirectorySuggestion = defaultDirectory.absolutePath,
             needsStoragePermission = !hasManageStoragePermission(),
-            enabledProfileIds = detectionResult.enabledIds.ifEmpty { usbProfiles.map { it.id }.toSet() },
-            recommendedProfileId = detectionResult.recommendedProfileId,
-            usbProfileId = detectionResult.recommendedProfileId
+            enabledProfileIds = emptySet(),
+            recommendedProfileId = null,
+            usbProfileId = null
         )
     )
     val state: StateFlow<OnboardingUiState> = _state.asStateFlow()
@@ -48,7 +52,20 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
     init {
         viewModelScope.launch {
             repository.preferencesFlow.collect { prefs ->
-                val detection = detectionResult
+                // Use cached detection if available and valid, otherwise detect
+                val detection = if (prefs.isDetectionCacheValid && prefs.cachedDetectedProfiles.isNotEmpty()) {
+                    UsbProfileDetection(
+                        enabledIds = prefs.cachedDetectedProfiles,
+                        recommendedProfileId = prefs.cachedRecommendedProfile
+                    ).also { cachedDetectionResult = it }
+                } else {
+                    detectUsbProfiles(usbProfiles).also {
+                        cachedDetectionResult = it
+                        // Cache the new detection results
+                        repository.cacheProfileDetection(it.enabledIds, it.recommendedProfileId)
+                    }
+                }
+                
                 if (!autoProfileApplied && prefs.usbProfileId.isNullOrBlank() && detection.recommendedProfileId != null) {
                     autoProfileApplied = true
                     repository.setUsbProfile(detection.recommendedProfileId)
@@ -73,7 +90,9 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
                         needsStoragePermission = if (nextStep == OnboardingStep.STORAGE) !hasManageStoragePermission() else false,
                         completed = nextStep == OnboardingStep.COMPLETE,
                         isProcessing = false,
-                        errorMessage = if (nextStep != current.step) null else current.errorMessage
+                        errorMessage = if (nextStep != current.step) null else current.errorMessage,
+                        autoMountEnabled = prefs.autoMountEnabled,
+                        darkModeEnabled = prefs.darkModeEnabled
                     )
                 }
             }
@@ -157,6 +176,8 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val app = getApplication<Application>()
             val packageName = app.packageName
+            
+            // For Android 11+ (API 30+), request MANAGE_EXTERNAL_STORAGE
             val appIntent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
@@ -171,17 +192,41 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
                 } catch (_: ActivityNotFoundException) {
                     _state.update {
                         it.copy(
-                            errorMessage = "Unable to open storage settings. Grant All Files Access manually in system settings.",
+                            errorMessage = "Unable to open storage settings. Grant All Files Access manually:\n1. Open Settings\n2. Go to Apps → oLinky\n3. Enable \"All files access\"",
                             needsStoragePermission = true
                         )
                     }
                 }
             }
+        } else {
+            // For Android 10 and below, permissions should be requested at runtime
+            // But since we target API 26+, this is handled via manifest permissions
+            _state.update { it.copy(needsStoragePermission = false) }
         }
     }
 
     fun refreshStoragePermissionState() {
         _state.update { it.copy(needsStoragePermission = !hasManageStoragePermission()) }
+    }
+
+    fun resetOnboarding() {
+        viewModelScope.launch {
+            repository.clear()
+            autoProfileApplied = false
+            cachedDetectionResult = null
+        }
+    }
+
+    fun setAutoMountEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setAutoMountEnabled(enabled)
+        }
+    }
+
+    fun setDarkModeEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setDarkModeEnabled(enabled)
+        }
     }
 
     private fun detectUsbProfiles(profiles: List<UsbProfile>): UsbProfileDetection {
@@ -214,7 +259,8 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
                 hardwarePrefixes = listOf("exynos"),
                 modelPrefixes = listOf("sm-"),
                 devicePrefixes = listOf("starlte", "star2lte", "crownlte", "beyond", "d2s", "d1x"),
-                productPrefixes = listOf("starlte", "star2lte", "crownlte", "beyond", "d2s", "d1x")
+                productPrefixes = listOf("starlte", "star2lte", "crownlte", "beyond", "d2s", "d1x"),
+                requiresUdcMatch = true
             ),
             UsbProfileDetector(
                 profileId = "qualcomm_qti",
@@ -257,7 +303,7 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
             .firstOrNull { detector ->
                 val profile = profiles.firstOrNull { it.id == detector.profileId }
                 val udcCandidateHit = profile?.udcCandidates?.any(::udcPathExists) ?: false
-                detector.matches(
+                val matchesSignals = detector.matches(
                     manufacturer = manufacturer,
                     brand = brand,
                     device = device,
@@ -265,7 +311,9 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
                     hardware = hardware,
                     board = board,
                     product = product
-                ) || udcCandidateHit
+                )
+                val meetsRequirement = if (detector.requiresUdcMatch) udcCandidateHit else true
+                (matchesSignals || udcCandidateHit) && meetsRequirement
             }
 
         val recommendedId = udcMatch?.id ?: heuristicMatch?.profileId
@@ -299,7 +347,8 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
         val modelPrefixes: List<String> = emptyList(),
         val hardwarePrefixes: List<String> = emptyList(),
         val boardPrefixes: List<String> = emptyList(),
-        val productPrefixes: List<String> = emptyList()
+        val productPrefixes: List<String> = emptyList(),
+        val requiresUdcMatch: Boolean = false
     ) {
         fun matches(
             manufacturer: String,
@@ -344,20 +393,19 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
 
     private suspend fun ensureDirectoryWithRoot(target: File): String? {
         val absolutePath = target.absolutePath
-        val escapedPath = absolutePath.replace("\"", "\\\"")
-                val script = """
-                        set -e
-                        TARGET=\"$escapedPath\"
-                        PARENT=\"\${'$'}(dirname \"$escapedPath\")\"
-                        if [ ! -d \"$escapedPath\" ]; then
-                            mkdir -p \"$escapedPath\"
-                        fi
-                        if [ -d \"$escapedPath\" ]; then
-                            OWNER=\${'$'}(stat -c '%u:%g' \"$escapedPath\" 2>/dev/null || stat -c '%u:%g' \"\${'$'}PARENT\")
-                            chown \${'$'}OWNER \"$escapedPath\"
-                            chmod 775 \"$escapedPath\"
-                        fi
-                """.trimIndent()
+        val script = """
+            set -e
+            TARGET='${absolutePath.replace("'", "'\\''")}'
+            PARENT=${'$'}(dirname "${'$'}TARGET")
+            if [ ! -d "${'$'}TARGET" ]; then
+                mkdir -p "${'$'}TARGET"
+            fi
+            if [ -d "${'$'}TARGET" ]; then
+                OWNER=${'$'}(stat -c '%u:%g' "${'$'}TARGET" 2>/dev/null || stat -c '%u:%g' "${'$'}PARENT")
+                chown ${'$'}OWNER "${'$'}TARGET"
+                chmod 775 "${'$'}TARGET"
+            fi
+        """.trimIndent()
         val result = RootShell.runScript(script)
         return if (result.exitCode == 0) {
             ensureDirectory(target)

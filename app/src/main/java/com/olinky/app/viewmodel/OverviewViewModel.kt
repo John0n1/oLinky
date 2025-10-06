@@ -1,213 +1,411 @@
 package com.olinky.app.viewmodel
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import android.net.Uri
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.olinky.app.model.DiskImageUiModel
-import com.olinky.app.model.GadgetMode
-import com.olinky.app.model.GadgetStatusUiModel
 import com.olinky.app.model.OverviewUiState
-import java.util.UUID
-import kotlinx.coroutines.delay
+import com.olinky.app.module.MagiskModuleInstaller
+import com.olinky.app.module.ModuleStatus
+import com.olinky.core.gadget.GadgetConfig
+import com.olinky.core.gadget.MassStorageConfigRequest
+import com.olinky.core.root.RootShell
+import com.olinky.data.ImageRepository
+import com.olinky.data.OnboardingRepository
+import com.olinky.feature.pxe.PxeController
+import dagger.hilt.android.lifecycle.HiltViewModel
+import android.text.format.Formatter
+import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import javax.inject.Inject
 
-class OverviewViewModel : ViewModel() {
+@HiltViewModel
+class OverviewViewModel @Inject constructor(
+    application: Application,
+    private val imageRepository: ImageRepository,
+    private val onboardingRepository: OnboardingRepository,
+    private val gadgetConfig: GadgetConfig,
+    private val pxeController: PxeController,
+    private val moduleInstaller: MagiskModuleInstaller
+) : AndroidViewModel(application) {
 
-    private val _state = MutableStateFlow(createInitialState())
-    val state: StateFlow<OverviewUiState> = _state.asStateFlow()
+    private val appContext = application
 
-    fun refresh() {
-        _state.update { current ->
-            current.copy(errors = emptyList())
-        }
+    private val _uiState = MutableStateFlow(OverviewUiState())
+    val uiState: StateFlow<OverviewUiState> = _uiState.asStateFlow()
+
+    init {
+        loadInitialState()
+        observeImageLibrary()
+        checkPermissionsAndGadgets()
     }
 
-    fun mountImage(imageId: String, writable: Boolean) {
-        operateWithSpinner {
-            val image = _state.value.images.firstOrNull { it.id == imageId }
-                ?: return@operateWithSpinner registerError("Image not found")
-
-            _state.update { current ->
-                val updatedImages = current.images.map {
-                    if (it.id == imageId) it.copy(mounted = true, writable = writable)
-                    else it.copy(mounted = false)
-                }
-                current.copy(
-                    images = updatedImages,
-                    selectedImageId = imageId,
-                    gadgetStatus = GadgetStatusUiModel(
-                        mode = GadgetMode.MassStorage,
-                        connectionLabel = "Mass storage gadget active",
-                        hostConnected = current.gadgetStatus.hostConnected,
-                        lastOperation = "Mounted ${image.displayName} (${if (writable) "RW" else "RO"})"
-                    ),
-                    errors = emptyList()
-                )
-            }
-        }
-    }
-
-    fun unmountImage(imageId: String) {
-        operateWithSpinner {
-            _state.update { current ->
-                if (current.selectedImageId != imageId) current
-                else {
-                    val updated = current.images.map { it.copy(mounted = false) }
-                    current.copy(
-                        images = updated,
-                        selectedImageId = null,
-                        gadgetStatus = GadgetStatusUiModel(
-                            mode = GadgetMode.Idle,
-                            connectionLabel = "USB gadget idle",
-                            hostConnected = false,
-                            lastOperation = "Unmounted image"
-                        ),
-                        errors = emptyList()
-                    )
-                }
-            }
-        }
-    }
-
-    fun startPxe() {
-        operateWithSpinner {
-            _state.update { current ->
-                current.copy(
-                    gadgetStatus = GadgetStatusUiModel(
-                        mode = GadgetMode.Pxe,
-                        connectionLabel = "PXE services listening",
-                        hostConnected = true,
-                        lastOperation = "PXE stack started"
-                    ),
-                    errors = emptyList()
-                )
-            }
-        }
-    }
-
-    fun stopPxe() {
-        operateWithSpinner {
-            _state.update { current ->
-                current.copy(
-                    gadgetStatus = GadgetStatusUiModel(
-                        mode = GadgetMode.Idle,
-                        connectionLabel = "Services stopped",
-                        hostConnected = false,
-                        lastOperation = "PXE stack stopped"
-                    )
-                )
-            }
-        }
-    }
-
-    fun toggleWritable(imageId: String) {
-        _state.update { current ->
-            val image = current.images.firstOrNull { it.id == imageId } ?: return@update current
-            val updated = current.images.map {
-                if (it.id == imageId) it.copy(writable = !image.writable) else it
-            }
-            current.copy(images = updated)
-        }
-    }
-
-    fun addSampleImage() {
-        _state.update { current ->
-            val sample = DiskImageUiModel(
-                id = UUID.randomUUID().toString(),
-                displayName = "Custom ISO ${current.images.size + 1}",
-                sizeBytes = 2_048_000_000L,
-                filesystem = "ISO9660",
-                bootable = true,
-                mounted = false,
-                writable = false,
-                notes = "Imported locally"
-            )
-            current.copy(images = current.images + sample)
-        }
-    }
-
-    fun setHostConnection(connected: Boolean) {
-        _state.update { current ->
-            current.copy(
-                gadgetStatus = current.gadgetStatus.copy(
-                    hostConnected = connected,
-                    connectionLabel = if (connected) "Host detected" else "Waiting for host",
-                    lastOperation = current.gadgetStatus.lastOperation
-                )
-            )
-        }
-    }
-
-    fun clearErrors() {
-        _state.update { it.copy(errors = emptyList()) }
-    }
-
-    private fun operateWithSpinner(block: suspend () -> Unit) {
+    private fun checkPermissionsAndGadgets() {
         viewModelScope.launch {
-            _state.update { it.copy(isBusy = true) }
-            try {
-                block()
-            } finally {
-                delay(150)
-                _state.update { it.copy(isBusy = false) }
+            _uiState.update { it.copy(isBusy = true, statusMessage = "Checking permissions...") }
+            val status = moduleInstaller.checkAndInstallIfNeeded()
+            _uiState.update { it.copy(moduleStatus = status) }
+
+            if (status == ModuleStatus.OK) {
+                _uiState.update { it.copy(statusMessage = "Checking for active gadgets...") }
+                // Check for existing mount
+                gadgetConfig.getMountedImagePath("olinky").onSuccess { path ->
+                    if (path != null) {
+                        _uiState.update {
+                            it.copy(
+                                isMounted = true,
+                                mountedImagePath = path,
+                                selectedImageUri = Uri.parse(path), // This is not a real URI, but good for display
+                                selectedImageName = path.substringAfterLast('/'),
+                                statusMessage = "Mounted: ${path.substringAfterLast('/')}"
+                            )
+                        }
+                    }
+                }
+                // Check for existing PXE
+                pxeController.isPxeRunning().onSuccess { running ->
+                    if (running) {
+                        _uiState.update {
+                            it.copy(
+                                isPxeRunning = true,
+                                pxeStatusMessage = "PXE is Active"
+                            )
+                        }
+                    }
+                }
+                _uiState.update { it.copy(statusMessage = "Ready") }
+            } else {
+                _uiState.update { it.copy(statusMessage = "SELinux permissions needed") }
+            }
+            _uiState.update { it.copy(isBusy = false) }
+        }
+    }
+
+    fun onRebootAction() {
+        viewModelScope.launch(Dispatchers.IO) {
+            RootShell.runScript("reboot")
+        }
+    }
+
+    private fun loadInitialState() {
+        viewModelScope.launch {
+            onboardingRepository.preferencesFlow.collectLatest { prefs ->
+                val libraryDir = prefs.imageDirectory?.let { File(it) }
+                if (libraryDir != null) {
+                    imageRepository.refreshFromDirectory(libraryDir)
+                }
+                _uiState.update { current ->
+                    current.copy(
+                        libraryPath = prefs.imageDirectory,
+                        usbProfileLabel = prefs.usbProfileId,
+                        rootGranted = prefs.rootGranted,
+                        autoMountEnabled = prefs.autoMountEnabled,
+                        darkModeEnabled = prefs.darkModeEnabled
+                    )
+                }
             }
         }
     }
 
-    private fun registerError(message: String) {
-        _state.update { current ->
-            current.copy(
-                errors = current.errors + message,
-                isBusy = false
+    fun refreshLibrary() {
+        val path = _uiState.value.libraryPath ?: return
+        viewModelScope.launch {
+            imageRepository.refreshFromDirectory(File(path))
+        }
+    }
+
+    fun createBlankImage(fileName: String, sizeBytes: Long) {
+        if (_uiState.value.isBusy) return
+        val libraryPath = _uiState.value.libraryPath
+        if (libraryPath.isNullOrBlank()) {
+            _uiState.update {
+                it.copy(statusMessage = "Configure a library directory in Settings before creating images.")
+            }
+            return
+        }
+        if (sizeBytes <= 0L) {
+            _uiState.update {
+                it.copy(statusMessage = "Image size must be greater than zero.")
+            }
+            return
+        }
+
+        val directory = File(libraryPath)
+        viewModelScope.launch {
+            _uiState.update { it.copy(isBusy = true, statusMessage = "Creating $fileName...") }
+            val result = withContext(Dispatchers.IO) {
+                imageRepository.createBlankImage(directory, fileName, sizeBytes)
+            }
+
+            if (result.isSuccess) {
+                val file = result.getOrNull()
+                if (file != null) {
+                    withContext(Dispatchers.IO) {
+                        imageRepository.refreshFromDirectory(directory)
+                    }
+                    _uiState.update {
+                        it.copy(
+                            isBusy = false,
+                            statusMessage = "Created ${file.name}",
+                            selectedImageId = file.absolutePath,
+                            selectedImageUri = Uri.fromFile(file),
+                            selectedImageName = file.name,
+                            selectedImageSize = file.length()
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            isBusy = false,
+                            statusMessage = "Failed to create image: unknown error"
+                        )
+                    }
+                }
+            } else {
+                val error = result.exceptionOrNull()
+                _uiState.update {
+                    it.copy(
+                        isBusy = false,
+                        statusMessage = "Failed to create image: ${error?.message ?: "unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    private fun observeImageLibrary() {
+        viewModelScope.launch {
+            imageRepository.observeImages().collectLatest { storedImages ->
+                val mapped = storedImages.map { stored ->
+                    DiskImageUiModel(
+                        id = stored.id,
+                        displayName = stored.label,
+                        path = stored.path,
+                        sizeBytes = stored.sizeBytes,
+                        bootable = stored.bootable,
+                        mounted = uiState.value.mountedImagePath == stored.path,
+                        writable = true,
+                        lastModifiedMillis = stored.lastModifiedMillis,
+                        notes = null
+                    )
+                }
+
+                val currentState = _uiState.value
+                val selectedId = when {
+                    currentState.selectedImageId != null && mapped.any { it.id == currentState.selectedImageId } ->
+                        currentState.selectedImageId
+                    mapped.isNotEmpty() -> mapped.first().id
+                    else -> null
+                }
+                val selected = mapped.firstOrNull { it.id == selectedId }
+                _uiState.update {
+                    it.copy(
+                        images = mapped,
+                        selectedImageId = selected?.id,
+                        selectedImageUri = selected?.path?.let { path -> Uri.fromFile(File(path)) },
+                        selectedImageName = selected?.displayName ?: "No image selected",
+                        selectedImageSize = selected?.sizeBytes ?: 0
+                    )
+                }
+            }
+        }
+    }
+
+    fun onImageEntrySelected(imageId: String) {
+        val image = _uiState.value.images.firstOrNull { it.id == imageId } ?: return
+        _uiState.update {
+            it.copy(
+                selectedImageId = image.id,
+                selectedImageUri = Uri.fromFile(File(image.path)),
+                selectedImageName = image.displayName,
+                selectedImageSize = image.sizeBytes,
+                statusMessage = "Selected image: ${image.displayName} (${formatFileSize(image.sizeBytes)})"
             )
         }
     }
 
-    private fun createInitialState(): OverviewUiState {
-        val images = listOf(
-            DiskImageUiModel(
-                id = UUID.randomUUID().toString(),
-                displayName = "Debian 12 NetInstall",
-                sizeBytes = 400_000_000L,
-                filesystem = "ISO9660",
-                bootable = true,
-                mounted = false,
-                writable = false,
-                notes = "UEFI & legacy"
-            ),
-            DiskImageUiModel(
-                id = UUID.randomUUID().toString(),
-                displayName = "Ventoy Rescue Kit",
-                sizeBytes = 1_500_000_000L,
-                filesystem = "exFAT",
-                bootable = true,
-                mounted = false,
-                writable = true,
-                notes = "Diagnostics bundle"
-            ),
-            DiskImageUiModel(
-                id = UUID.randomUUID().toString(),
-                displayName = "FreeDOS Utility",
-                sizeBytes = 64_000_000L,
-                filesystem = "FAT32",
-                bootable = true,
-                mounted = false,
-                writable = true,
-                notes = "Flash BIOS scripts"
-            )
-        )
-        return OverviewUiState(
-            images = images,
-            gadgetStatus = GadgetStatusUiModel(
-                mode = GadgetMode.Idle,
-                connectionLabel = "USB gadget idle",
-                hostConnected = false,
-                lastOperation = "Ready to mount"
-            ),
-            errors = emptyList()
-        )
+    fun onMountToggle(mount: Boolean) {
+        if (mount) {
+            mountImage()
+        } else {
+            unmountImage()
+        }
     }
+
+    private fun mountImage() {
+        val imagePath = _uiState.value.images
+            .firstOrNull { it.id == _uiState.value.selectedImageId }
+            ?.path
+        if (imagePath == null) {
+            _uiState.update { it.copy(statusMessage = "Select an image from your library before mounting.") }
+            return
+        }
+
+        viewModelScope.launch {
+            if (uiState.value.moduleStatus != ModuleStatus.OK) {
+                _uiState.update { it.copy(statusMessage = "SELinux helper required. Install and reboot first.") }
+                return@launch
+            }
+            _uiState.update { it.copy(isBusy = true, statusMessage = "Mounting ${uiState.value.selectedImageName}...") }
+            withContext(Dispatchers.IO) {
+                val request = MassStorageConfigRequest(
+                    gadgetName = "olinky",
+                    imagePath = imagePath
+                )
+                gadgetConfig.applyMassStorageConfig(request).fold(
+                    onSuccess = {
+                        _uiState.update {
+                            it.copy(
+                                isMounted = true,
+                                mountedImagePath = imagePath,
+                                mountedImageId = _uiState.value.selectedImageId,
+                                isBusy = false,
+                                statusMessage = "Mounted: ${it.selectedImageName}"
+                            )
+                        }
+                    },
+                    onFailure = { error ->
+                        _uiState.update {
+                            it.copy(
+                                isMounted = false,
+                                isBusy = false,
+                                statusMessage = "Mount failed: ${error.message}"
+                            )
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    private fun unmountImage() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isBusy = true, statusMessage = "Unmounting...") }
+            withContext(Dispatchers.IO) {
+                gadgetConfig.tearDownMassStorage("olinky").fold(
+                    onSuccess = {
+                        _uiState.update {
+                            it.copy(
+                                isMounted = false,
+                                mountedImagePath = null,
+                                mountedImageId = null,
+                                isBusy = false,
+                                statusMessage = "Unmounted successfully"
+                            )
+                        }
+                    },
+                    onFailure = { error ->
+                        // Even if it fails, update state to reflect the desired outcome
+                        _uiState.update {
+                            it.copy(
+                                isMounted = false,
+                                isBusy = false,
+                                statusMessage = "Unmount failed: ${error.message}"
+                            )
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    fun onPxeToggle(enable: Boolean) {
+        if (enable) {
+            enablePxe()
+        } else {
+            disablePxe()
+        }
+    }
+
+    private fun enablePxe() {
+        viewModelScope.launch {
+            if (uiState.value.moduleStatus != ModuleStatus.OK) {
+                _uiState.update { it.copy(pxeStatusMessage = "SELinux helper required. Install and reboot first.") }
+                return@launch
+            }
+            _uiState.update { it.copy(isBusy = true, pxeStatusMessage = "Starting PXE...") }
+            withContext(Dispatchers.IO) {
+                pxeController.startPxe().fold(
+                    onSuccess = {
+                        pxeController.startServers().fold(
+                            onSuccess = {
+                                _uiState.update {
+                                    it.copy(
+                                        isPxeRunning = true,
+                                        isBusy = false,
+                                        pxeStatusMessage = "PXE servers started"
+                                    )
+                                }
+                            },
+                            onFailure = { serverError ->
+                                _uiState.update {
+                                    it.copy(
+                                        isBusy = false,
+                                        pxeStatusMessage = "Error starting servers: ${serverError.message}"
+                                    )
+                                }
+                            }
+                        )
+                    },
+                    onFailure = { gadgetError ->
+                        _uiState.update {
+                            it.copy(
+                                isPxeRunning = false,
+                                isBusy = false,
+                                pxeStatusMessage = "PXE startup failed: ${gadgetError.message}"
+                            )
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+    private fun disablePxe() {
+        viewModelScope.launch {
+            if (uiState.value.moduleStatus != ModuleStatus.OK) {
+                _uiState.update { it.copy(pxeStatusMessage = "SELinux helper required. Install and reboot first.") }
+                return@launch
+            }
+            _uiState.update { it.copy(isBusy = true, pxeStatusMessage = "Stopping PXE...") }
+            withContext(Dispatchers.IO) {
+                val serverResult = pxeController.stopServers()
+                val gadgetResult = pxeController.stopPxe()
+                val networkResult = pxeController.teardownNetwork()
+
+                val failure = serverResult.exceptionOrNull()
+                    ?: gadgetResult.exceptionOrNull()
+                    ?: networkResult.exceptionOrNull()
+
+                if (failure == null) {
+                    _uiState.update {
+                        it.copy(
+                            isPxeRunning = false,
+                            isBusy = false,
+                            pxeStatusMessage = "PXE disabled"
+                        )
+                    }
+                } else {
+                    val gadgetStopped = gadgetResult.isSuccess
+                    _uiState.update {
+                        it.copy(
+                            isPxeRunning = if (gadgetStopped) false else it.isPxeRunning,
+                            isBusy = false,
+                            pxeStatusMessage = "Failed to stop PXE: ${failure.message}"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun formatFileSize(bytes: Long): String = Formatter.formatShortFileSize(appContext, bytes)
 }

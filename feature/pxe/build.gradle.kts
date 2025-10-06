@@ -25,6 +25,7 @@ android {
 
 dependencies {
     implementation(project(":core:gadget"))
+    implementation(project(":core:root"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("androidx.annotation:annotation:1.8.0")
 
