@@ -4,60 +4,55 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
 import com.olinky.app.ui.OLinkyAppTheme
+import com.olinky.app.ui.screens.OnboardingScreen
+import com.olinky.app.ui.screens.OverviewScreen
+import com.olinky.app.viewmodel.OnboardingViewModel
 import com.olinky.app.viewmodel.OverviewViewModel
-import kotlinx.coroutines.flow.flowOf
 
 class MainActivity : ComponentActivity() {
-    private val viewModel = OverviewViewModel()
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
             OLinkyAppTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    val uiState by viewModel.state.collectAsState()
-                    OverviewScreen(state = uiState)
+                Surface(color = MaterialTheme.colorScheme.background) {
+                    val onboardingViewModel: OnboardingViewModel = viewModel()
+                    val onboardingState by onboardingViewModel.state.collectAsState()
+
+                    if (!onboardingState.completed) {
+                        OnboardingScreen(
+                            state = onboardingState,
+                            onRequestRoot = onboardingViewModel::requestRootAccess,
+                            onCreateDirectory = onboardingViewModel::createDefaultDirectory,
+                            onSelectUsbProfile = onboardingViewModel::selectUsbProfile,
+                            onDismissError = onboardingViewModel::clearError,
+                            onRequestStoragePermission = onboardingViewModel::requestStoragePermission,
+                            onRefreshStoragePermission = onboardingViewModel::refreshStoragePermissionState
+                        )
+                    } else {
+                        val overviewViewModel: OverviewViewModel = viewModel()
+                        val overviewState by overviewViewModel.state.collectAsState()
+
+                        OverviewScreen(
+                            state = overviewState,
+                            onMountImage = { id, writable -> overviewViewModel.mountImage(id, writable) },
+                            onUnmountImage = overviewViewModel::unmountImage,
+                            onToggleWritable = overviewViewModel::toggleWritable,
+                            onStartPxe = overviewViewModel::startPxe,
+                            onStopPxe = overviewViewModel::stopPxe,
+                            onAddSampleImage = overviewViewModel::addSampleImage,
+                            onRefreshStatus = overviewViewModel::refresh,
+                            onClearErrors = overviewViewModel::clearErrors
+                        )
+                    }
                 }
             }
         }
     }
 }
-
-@Composable
-fun OverviewScreen(state: OverviewUiState) {
-    Column(modifier = Modifier.padding(24.dp)) {
-        Text(
-            text = "oLinky",
-            style = MaterialTheme.typography.headlineLarge,
-            modifier = Modifier.padding(bottom = 12.dp)
-        )
-        Text(
-            text = state.statusMessage,
-            style = MaterialTheme.typography.bodyLarge,
-            textAlign = TextAlign.Start
-        )
-    }
-}
-
-class OverviewViewModel {
-    val state = flowOf(OverviewUiState(statusMessage = "Preparing USB gadget environment..."))
-}
-
-data class OverviewUiState(val statusMessage: String)

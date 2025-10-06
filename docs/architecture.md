@@ -125,6 +125,31 @@
 4. Automations, profiles, and advanced settings.
 5. Device compatibility matrix & community contributions.
 
+## Onboarding Wizard Concept
+To keep first-run friction low while still gathering the capabilities we need, a guided setup will walk the user through three critical steps before unlocking the main dashboard.
+
+### Step 1: Root Permission Handshake
+- Detect the presence of `su` binaries (Magisk, SuperSU, or built-in) and issue a no-op test command (`id -u`).
+- Trigger a foreground request so the superuser client shows a permission prompt; surface rationale text explaining the requirement.
+- Persist the grant status in DataStore; monitor for revocation and provide retry options.
+- Offer troubleshooting help if root is missing (link to docs, show detected binaries, SELinux mode).
+
+### Step 2: Image Library Directory
+- Propose a default folder under scoped storage (e.g., `/storage/emulated/0/oLinky/images`) with a one-tap “Create & Open” action.
+- Allow advanced users to pick an alternate path, including root-protected directories like `/data/media/0/oLinky` when root browsing is available.
+- Verify read/write access and loopback support (create tiny temp file, attempt to attach loop device when possible).
+- Present quick tips for placing ISO/IMG files and offer sample downloads.
+
+### Step 3: USB Gadget Profile Selection
+- Query `/sys/class/udc` and known OEM quirks to list viable UDC targets (e.g., `a600000.dwc3`, `dwc3-musb-hdrc`).
+- Provide presets for common OEM kernels (Pixel A/B, Samsung DS, OnePlus) with descriptions of supported gadget combinations (Mass Storage, RNDIS, CDC-ECM).
+- Store the chosen profile and allow manual override later in settings.
+- Run a smoke test script that binds/unbinds an empty ConfigFS gadget to confirm the selection before completing onboarding.
+
+### Completion & Main Menu
+- Once all steps succeed, transition into the dashboard with contextual cards that reflect the configured directory, root status, and selected USB profile.
+- The wizard remains accessible under Settings for reconfiguration or onboarding new profiles.
+
 ## External Dependencies
 - Busybox binaries (statically linked) for consistency.
 - dnsmasq or similar lightweight DHCP/TFTP packages.
